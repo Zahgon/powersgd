@@ -34,10 +34,7 @@ def is_distributed() -> bool:
 
 
 def flatten(tensors: List[List[torch.Tensor]]) -> List[torch.Tensor]:
-    out = []
-    for list in tensors:
-        out.extend(list)
-    return out
+    pass
 
 
 def allreduce_average(data, *args, **kwargs):

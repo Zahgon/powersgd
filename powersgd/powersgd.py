@@ -21,14 +21,7 @@ class Aggregator(ABC):
 
 class AllReduce(Aggregator):
     def aggregate(self, gradients: List[torch.Tensor]) -> List[torch.Tensor]:
-        if len(gradients) == 0:
-            return []
-        buffer, shapes = pack(gradients)
-        allreduce_average(buffer)
-        out = unpack(buffer, shapes)
-        for g in gradients:
-            g.zero_()
-        return out
+        pass
 
 
 class Config(NamedTuple):
@@ -39,10 +32,6 @@ class Config(NamedTuple):
 
 
 class PowerSGD(Aggregator):
-    """
-    Applies PowerSGD only after a configurable number of steps,
-    and only on parameters with strong compression.
-    """
 
     def __init__(self, params: List[torch.Tensor], config: Config):
         self.config = config
@@ -62,47 +51,18 @@ class PowerSGD(Aggregator):
         self._allreduce = AllReduce()
 
     def aggregate(self, gradients: List[torch.Tensor]) -> List[torch.Tensor]:
-        self.step_counter += 1
-
-        if self.step_counter <= self.config.start_compressing_after_num_steps:
-            return self._allreduce.aggregate(gradients)
-
-        compressed_grads, uncompressed_grads = self._split(gradients)
-        return self._merge(
-            self._powersgd.aggregate(compressed_grads),
-            self._allreduce.aggregate(uncompressed_grads),
-        )
+        pass
 
     def _split(self, params: List[torch.Tensor]):
-        compressed_params = []
-        uncompressed_params = []
-        for param, is_compressed in zip(params, self.is_compressed_mask):
-            if is_compressed:
-                compressed_params.append(param)
-            else:
-                uncompressed_params.append(param)
-        return compressed_params, uncompressed_params
+        pass
 
     def _merge(
         self, compressed: List[torch.Tensor], uncompressed: List[torch.Tensor]
     ) -> List[torch.Tensor]:
-        assert len(compressed) + len(uncompressed) == len(self.is_compressed_mask)
-        compressed_iter = iter(compressed)
-        uncompressed_iter = iter(uncompressed)
-        merged_list = []
-        for is_compressed in self.is_compressed_mask:
-            if is_compressed:
-                merged_list.append(next(compressed_iter))
-            else:
-                merged_list.append(next(uncompressed_iter))
-
-        return merged_list
+        pass
 
     def _should_compress(self, shape: torch.Size) -> bool:
-        return (
-            shape.numel() / avg_compressed_size(shape, self.config)
-            > self.config.min_compression_rate
-        )
+        pass
 
 
 class BasicConfig(NamedTuple):
@@ -112,21 +72,15 @@ class BasicConfig(NamedTuple):
 
 class BasicPowerSGD(Aggregator):
     def __init__(self, params: List[torch.Tensor], config: BasicConfig):
-        # Configuration
         self.config = config
         self.params = list(params)
         self.device = self.params[0].device
         self.dtype = self.params[0].dtype
         self.params_per_shape = self._matrices_per_shape(self.params)
 
-        # State
         self.generator = torch.Generator(device=self.device).manual_seed(0)
         self.step_counter = 0
 
-        # Initilize and allocate the low rank approximation matrices p and q.
-        # _ps_buffer and _qs_buffer are contiguous memory that can be easily all-reduced, and
-        # _ps and _qs are pointers into this memory.
-        # _ps and _qs represent batches p/q for all tensors of the same shape.
         self._ps_buffer, ps_shapes = pack(
             [
                 self._init_p_batch(shape, params)
@@ -144,151 +98,46 @@ class BasicPowerSGD(Aggregator):
         self._qs = unpack(self._qs_buffer, qs_shapes)
 
     def aggregate(self, gradients: List[torch.Tensor]) -> List[torch.Tensor]:
-        """
-        Create a low-rank approximation of the average gradients by communicating with other workers.
-        Modifies its inputs so that they contain the 'approximation error', used for the error feedback
-        mechanism.
-        """
-        # Allocate memory for the return value of this function
-        output_tensors = [torch.empty_like(g) for g in gradients]
-
-        # Group the gradients per shape, and view them as matrices (2D tensors)
-        gradients_per_shape = self._matrices_per_shape(gradients)
-        outputs_per_shape = self._matrices_per_shape(output_tensors)
-        shape_groups = [
-            dict(
-                shape=shape,
-                grads=matrices,
-                outputs=outputs_per_shape[shape],
-                grad_batch=torch.stack(matrices),
-                approximation=torch.zeros(
-                    size=(len(matrices), *shape), device=self.device, dtype=self.dtype
-                ),
-            )
-            for shape, matrices in list(gradients_per_shape.items())
-        ]
-
-        num_iters_per_step = self.config.num_iters_per_step
-        for it in range(num_iters_per_step):
-            # Alternate between left and right matrix multiplications
-            iter_is_even = (self.step_counter * num_iters_per_step + it) % 2 == 0
-            if iter_is_even:
-                maybe_transpose = lambda g: g
-                out_batches, in_batches = self._qs, self._ps
-                out_buffer = self._qs_buffer
-            else:
-                maybe_transpose = batch_transpose
-                out_batches, in_batches = self._ps, self._qs
-                out_buffer = self._ps_buffer
-
-            # Matrix multiplication
-            for group, in_batch, out_batch in zip(
-                shape_groups, in_batches, out_batches
-            ):
-                orthogonalize(in_batch)
-                torch.bmm(
-                    batch_transpose(maybe_transpose(group["grad_batch"])), 
-                    in_batch, 
-                    out=out_batch
-                )
-
-            for group, in_batch, out_batch in zip(
-                shape_groups, in_batches, out_batches
-            ):
-                maybe_transpose(group["grad_batch"]).baddbmm_(
-                    in_batch, 
-                    batch_transpose(out_batch), 
-                    alpha=-1
-                )
-
-            # Average across workers
-            if is_distributed():
-                num_workers = torch.distributed.get_world_size()
-                torch.distributed.all_reduce(out_buffer)
-            else:
-                num_workers = 1
-
-            # Construct low-rank reconstruction and update the approximation and error buffer
-            for group, in_batch, out_batch in zip(
-                shape_groups, in_batches, out_batches
-            ):
-                maybe_transpose(group["approximation"]).baddbmm_(
-                    in_batch, 
-                    batch_transpose(out_batch),
-                    alpha=1/num_workers
-                )
-
-        # Un-batch the approximation and error feedback, write to the output
-        for group in shape_groups:
-            for o, m, approx, mb in zip(
-                group["outputs"],
-                group["grads"],
-                group["approximation"],
-                group["grad_batch"],
-            ):
-                o.copy_(approx)
-                m.copy_(mb)
-
-        # Increment the step counter
-        self.step_counter += 1
-
-        return output_tensors
+        pass
 
     def _init_p_batch(
         self, shape: torch.Size, params: List[torch.Tensor]
     ) -> torch.Tensor:
-        rank = min(self.config.rank, min(shape))
-        return torch.randn(
-            [len(params), shape[0], rank], generator=self.generator, device=self.device
-        )
+        pass
 
     def _init_q_batch(
         self, shape: torch.Size, params: List[torch.Tensor]
     ) -> torch.Tensor:
-        rank = min(self.config.rank, min(shape))
-        return torch.randn(
-            [len(params), shape[1], rank], generator=self.generator, device=self.device
-        )
+        pass
 
     @classmethod
     def _matrices_per_shape(
         cls,
         tensors: List[torch.Tensor],
     ) -> Dict[torch.Size, List[torch.Tensor]]:
-        shape2tensors = defaultdict(list)
-        for tensor in tensors:
-            matrix = view_as_matrix(tensor)
-            shape = matrix.shape
-            shape2tensors[shape].append(matrix)
-        return shape2tensors
+        pass
 
     @property
     def uncompressed_num_floats(self) -> int:
-        return sum(param.shape.numel() for param in self.params)
+        pass
 
     @property
     def compressed_num_floats(self) -> float:
-        return sum(avg_compressed_size(p.shape, self.config) for p in self.params)
+        pass
 
     @property
     def compression_rate(self) -> float:
-        return self.uncompressed_num_floats / self.compressed_num_floats
+        pass
 
 
 
 def batch_transpose(batch_of_matrices):
-    return batch_of_matrices.permute([0, 2, 1])
+    pass
 
 
 def view_as_matrix(tensor: torch.Tensor):
-    """
-    Reshape a gradient tensor into a matrix shape, where the matrix has structure
-    [output features, input features].
-    For a convolutional layer, this groups all "kernel" dimensions with "input features".
-    """
-    return tensor.view(tensor.shape[0], -1)
+    pass
 
 
 def avg_compressed_size(shape: torch.Size, config: Union[Config, BasicConfig]) -> float:
-    rank = min(config.rank, min(shape))
-    return 0.5 * config.num_iters_per_step * rank * sum(shape)
+    pass
